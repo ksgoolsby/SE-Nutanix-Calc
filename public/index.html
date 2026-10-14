@@ -109,7 +109,7 @@ label{color:var(--mut);font-size:13px;display:flex;align-items:center;gap:6px}
         <button id="next">Next &#9654;</button>
         <button id="reset">Reset</button>
         <span class="sp"></span>
-        <label>Nodes <select id="nsel"><option>4</option><option selected>5</option><option>6</option><option>7</option><option>8</option></select></label>
+        <label>Nodes <select id="nsel"><option>3</option><option>4</option><option selected>5</option><option>6</option><option>7</option><option>8</option></select></label>
         <label>Speed <select id="spd"><option value="0.6">Slow</option><option value="1" selected>Normal</option><option value="2">Fast</option></select></label>
         <label><input type="checkbox" id="deepchk" checked> Under the hood</label>
       </div>
@@ -169,6 +169,18 @@ var STAGES=[
   p:"A replacement node joins. Data is rebalanced onto it in the background, with no downtime and no migration project.",
   d:"Node add or replace triggers Curator disk balancing across the cluster. VM placement can be rebalanced by AHV scheduling or live migration at your convenience."}
 ];
+var ALT3={
+ 4:{t:"No spare node: no self-heal",
+  p:"A 3-node cluster has no spare node to rebuild onto, so it does not re-protect the affected data on its own. Everything keeps running, but one copy is all that exists for those blocks. The cluster stays degraded until the failed node is repaired or replaced.",
+  d:"Sizing guidance is 4+ nodes if you want automatic rebuild (N+1). With 3 nodes, resiliency is not restored until the node returns or is replaced, and cluster metadata and configuration services are also running without a spare."},
+ 5:{t:"Running degraded",
+  p:"The cluster is up and the VMs are running, but it cannot take another node failure for the affected data. The clock runs until someone fixes the hardware. This is the trade-off of a 3-node cluster.",
+  d:"Fault tolerance for affected data stays at zero. Time to repair (parts, a hands-on tech, a hardware contract) is now your exposure window."},
+ 6:{t:"Replace node and re-protect",
+  p:"The repaired or replacement node joins and the missing copies are rebuilt onto it. Protection returns, but only after the hardware is back.",
+  d:"Node rejoin or replace triggers Curator to re-replicate under-replicated extent groups onto the new node."}
+};
+function ST(i){return (N===3&&ALT3[i])?ALT3[i]:STAGES[i]}
 var $=function(s){return document.querySelector(s)};
 var N=5,nodes,vms,copies,stage=0,F=2,fault=false,busy=false,playing=false,token=0,speed=1,flash={};
 
@@ -207,6 +219,7 @@ function haRestart(){
   });
 }
 function planRebuild(){
+  if(N===3&&nodes.filter(function(n){return n.up}).length<3)return [];
   var load=nodes.map(function(n){return copies.filter(function(c){return c.node===n.id&&c.state!=='lost'}).length});
   var tasks=[],eg;
   for(eg=0;eg<egTotal();eg++){
@@ -243,6 +256,7 @@ async function enter(k,animate,t){
   else if(k===3){haRestart();render();if(animate){setTimeout(function(){flash={};},1400);if(!await slp(900,t))return false}else flash={}}
   else if(k===4){
     tasks=planRebuild();
+    if(animate&&!tasks.length){if(!await slp(900,t))return false}
     if(!animate){tasks.forEach(function(x){copies.push({eg:x.eg,vm:x.vm,node:x.dst,role:'R',state:'ok'})});return true}
     size=Math.max(1,Math.ceil(tasks.length/4));
     for(i=0;i<tasks.length;i+=size){
@@ -259,6 +273,24 @@ async function enter(k,animate,t){
   else if(k===6){
     nodes[F].up=true;
     copies=copies.filter(function(c){return c.node!==F});
+    if(N===3){
+      tasks=planRebuild();
+      if(!animate){tasks.forEach(function(x){copies.push({eg:x.eg,vm:x.vm,node:x.dst,role:'R',state:'ok'})});return true}
+      render();
+      if(!await slp(700,t))return false;
+      size=Math.max(1,Math.ceil(tasks.length/3));
+      for(i=0;i<tasks.length;i+=size){
+        batch=tasks.slice(i,i+size);
+        batch.forEach(function(x){copies.push({eg:x.eg,vm:x.vm,node:x.dst,role:'R',state:'building'})});
+        render();
+        batch.forEach(function(x){drawFlow(x.src,x.dst,'rb')});
+        if(!await slp(1400,t))return false;
+        clearFlows('rb');
+        copies.forEach(function(c){if(c.state==='building')c.state='ok'});
+        render();
+      }
+      return true;
+    }
     moves=planRebalance();
     if(!animate){
       moves.forEach(function(mv){copies.push({eg:mv.c.eg,vm:mv.c.vm,node:F,role:mv.c.role,state:'ok'});copies.splice(copies.indexOf(mv.c),1)});
@@ -310,7 +342,7 @@ async function play(){
 }
 function back(){if(stage>0&&!busy)jumpTo(stage-1);else if(fault)jumpTo(stage)}
 function failSecond(n){
-  if(fault||stage<1||stage>4||!nodes[n].up||n===F)return;
+  if(fault||stage<1||stage>(N===3?5:4)||!nodes[n].up||n===F)return;
   token++;playing=false;busy=false;clearFlows();
   failNode(n);
   copies=copies.filter(function(c){return c.state!=='building'});
@@ -351,7 +383,8 @@ setInterval(function(){
 function render(){
   var counts=egCounts(),i,total=egTotal();
   var html='';
-  var canPick=(stage>=1&&stage<=4&&!fault);
+  var maxPick=(N===3?5:4);
+  var canPick=(stage>=1&&stage<=maxPick&&!fault);
   var stalledVM={};
   copies.forEach(function(c){if(counts[c.eg]===0)stalledVM[c.vm]=1});
   nodes.forEach(function(n){
@@ -402,18 +435,18 @@ function render(){
     b.innerHTML='<b>Second node lost before rebuild finished.</b> '+(none>0?
       none+' of '+total+' data blocks ('+Math.round(none/total*100)+'%) now have no surviving copy, so '+affected+' VM'+(affected===1?'':'s')+' stall until a node returns. Only data whose two copies lived on exactly these two nodes is hit; everything else stays online. If the failed nodes\' disks are intact and they come back, the data comes back. If not, that is a restore-from-backup or DR event. This is the RF2 exposure window: shorten it with more nodes and faster networking, use RF3 for critical workloads, and keep DR in place.'
       :'Every block still has a surviving copy, so nothing is offline, but protection is thinner than before. Lucky draw. Do not plan on luck.');
-  }else if(stage>=1&&stage<=4){
+  }else if(stage>=1&&stage<=maxPick){
     b.className='warn';
-    b.innerHTML='<b>Exposure window.</b> Some data has one copy until the rebuild completes. Click a healthy node below to fail a second one and see the blast radius.';
-  }else if(stage===5){
+    b.innerHTML=(N===3?'<b>Exposure window, open-ended.</b> Some data has one copy until the failed node is repaired or replaced. ':'<b>Exposure window.</b> Some data has one copy until the rebuild completes. ')+'Click a healthy node below to fail a second one and see the blast radius.';
+  }else if(stage===5&&N!==3){
     b.className='ok';b.innerHTML='<b>Protected again.</b> Same data, same VMs, one fewer node, no data lost.';
   }else b.className='';
 
-  var S=STAGES[stage];
+  var S=ST(stage);
   $('#story').innerHTML='<h2>'+(stage+1)+'. '+S.t+'</h2><p>'+S.p+'</p>'+($('#deepchk').checked?'<div id="deep"><b>Under the hood:</b> '+S.d+'</div>':'');
 
   $('#steps').innerHTML=STAGES.map(function(s,i){
-    return '<li data-s="'+i+'" class="'+(i<stage?'done':(i===stage?'cur':''))+'"><span class="n">'+(i+1)+'</span><span>'+s.t+'</span></li>';
+    return '<li data-s="'+i+'" class="'+(i<stage?'done':(i===stage?'cur':''))+'"><span class="n">'+(i+1)+'</span><span>'+ST(i).t+'</span></li>';
   }).join('');
   $('#play').innerHTML=playing?'&#10074;&#10074; Pause':'&#9654; Play';
   $('#next').disabled=busy||stage>=6||fault;
